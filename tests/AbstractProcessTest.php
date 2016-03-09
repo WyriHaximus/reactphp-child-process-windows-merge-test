@@ -13,6 +13,7 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
     public function testGetEnhanceSigchildCompatibility()
     {
         $process = new Process('echo foo');
+        $process->useWindowsWorkaround();
 
         $this->assertSame($process, $process->setEnhanceSigchildCompatibility(true));
         $this->assertTrue($process->getEnhanceSigchildCompatibility());
@@ -27,6 +28,7 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
     public function testSetEnhanceSigchildCompatibilityCannotBeCalledIfProcessIsRunning()
     {
         $process = new Process('sleep 1');
+        $process->useWindowsWorkaround();
 
         $process->start($this->createLoop());
         $process->setEnhanceSigchildCompatibility(false);
@@ -35,6 +37,7 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
     public function testGetCommand()
     {
         $process = new Process('echo foo');
+        $process->useWindowsWorkaround();
 
         $this->assertSame('echo foo', $process->getCommand());
     }
@@ -42,6 +45,7 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
     public function testIsRunning()
     {
         $process = new Process('sleep 1');
+        $process->useWindowsWorkaround();
 
         $this->assertFalse($process->isRunning());
         $process->start($this->createLoop());
@@ -71,7 +75,8 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
         $cmd = $this->getPhpCommandLine('echo getcwd(), PHP_EOL, count($_SERVER), PHP_EOL;');
 
         $loop = $this->createLoop();
-        $process = new Process($cmd);
+        $process = new Process($cmd, null, null, array("bypass_shell"=>true));
+        $process->useWindowsWorkaround();
 
         $output = '';
         $error = '';
@@ -104,10 +109,16 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
     public function testProcessWithCwd()
     {
         $cmd = $this->getPhpCommandLine('echo getcwd(), PHP_EOL;');
-        $cwd = defined('PHP_WINDOWS_VERSION_BUILD') ? 'C:\\' : '/';
+
+        if (defined('PHP_WINDOWS_VERSION_BUILD')) {
+            $testCwd = 'C:\\';
+        } else {
+            $testCwd = '/';
+        }
 
         $loop = $this->createLoop();
-        $process = new Process($cmd, $cwd);
+        $process = new Process($cmd, $testCwd, null, array("bypass_shell"=>true));
+        $process->useWindowsWorkaround();
 
         $output = '';
 
@@ -120,7 +131,7 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
 
         $loop->run();
 
-        $this->assertSame($cwd . PHP_EOL, $output);
+        $this->assertSame($testCwd . PHP_EOL, $output);
     }
 
     public function testProcessWithEnv()
@@ -138,7 +149,8 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
         }
 
         $loop = $this->createLoop();
-        $process = new Process($cmd, null, array('foo' => 'bar'));
+        $process = new Process($cmd, null, array('foo' => 'bar'), array("bypass_shell"=>true));
+        $process->useWindowsWorkaround();
 
         $output = '';
 
@@ -158,6 +170,7 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
     {
         $loop = $this->createLoop();
         $process = new Process('exit 0');
+        $process->useWindowsWorkaround();
 
         $called = false;
         $exitCode = 'initial';
@@ -188,7 +201,7 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
     public function testStartInvalidProcess()
     {
         if (defined('PHP_WINDOWS_VERSION_BUILD')) {
-            $this->markTestSkipped('Windows does not have an executable flag.');
+            $this->markTestSkipped('Windows does not have an executable flag. This test does not make sense on Windows.');
         }
 
         $cmd = tempnam(sys_get_temp_dir(), 'react');
@@ -218,6 +231,7 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
     public function testStartAlreadyRunningProcess()
     {
         $process = new Process('sleep 1');
+        $process->useWindowsWorkaround();
 
         $process->start($this->createLoop());
         $process->start($this->createLoop());
@@ -275,6 +289,7 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
 
         $loop = $this->createloop();
         $process = new Process('sleep 1; exit 0');
+        $process->useWindowsWorkaround();
 
         $called = false;
         $exitCode = 'initial';
@@ -315,6 +330,52 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
         $this->assertNull($process->getTermSignal());
         $this->assertFalse($process->isTerminated());
     }
+
+    public function outputSizeProvider() {
+        return [ [1000, 5], [10000, 5], [100000, 5] ];
+    }
+
+    /**
+     * @dataProvider outputSizeProvider
+     */
+    public function testProcessOutputOfSize($size, $expectedMaxDuration = 5)
+    {
+        // Note: very strange behaviour of Windows (PHP 5.5.6):
+        // on a 1000 long string, Windows succeeds.
+        // on a 10000 long string, Windows fails to output anything.
+        // On a 100000 long string, it takes a lot of time but succeeds.
+        $cmd = $this->getPhpBinary() . ' -r ' . escapeshellarg('echo str_repeat(\'o\', '.$size.'), PHP_EOL;');
+
+        if (defined('PHP_WINDOWS_VERSION_BUILD')) {
+            // Windows madness! for some obscure reason, the whole command lines needs to be
+            // wrapped in quotes (?!?)
+            $cmd = '"'.$cmd.'"';
+        }
+
+        $loop = $this->createLoop();
+        $process = new Process($cmd);
+        $process->useWindowsWorkaround();
+
+        $output = '';
+
+        $loop->addTimer(0.001, function(Timer $timer) use ($process, &$output) {
+            $process->start($timer->getLoop());
+            $process->stdout->on('data', function () use (&$output) {
+                $output .= func_get_arg(0);
+            });
+        });
+
+        $startTime = time();
+
+        $loop->run();
+
+        $endTime = time();
+
+        $this->assertEquals($size + strlen(PHP_EOL), strlen($output));
+        $this->assertSame(str_repeat('o', $size) . PHP_EOL, $output);
+        $this->assertLessThanOrEqual($expectedMaxDuration, $endTime - $startTime, "Process took longer than expected.");
+    }
+
 
     /**
      * @dataProvider provideOutputSizeAndExpectedMaxDuration
@@ -397,16 +458,6 @@ abstract class AbstractProcessTest extends \PHPUnit_Framework_TestCase
 
     private function getPhpCommandLine($phpCode)
     {
-        /* The following is a suitable workaround for Windows given some
-         * escapeshellarg() incompatibilies in older PHP versions and knowledge
-         * that we're only escaping echo statements destined for "php -r".
-         *
-         * See: http://php.net/manual/en/function.escapeshellarg.php#114873
-         */
-        $phpCode = defined('PHP_WINDOWS_VERSION_BUILD')
-            ? '"' . addcslashes($phpCode, '\\"') . '"'
-            : escapeshellarg($phpCode);
-
-        return $this->getPhpBinary() . ' -r ' . $phpCode;
+        return $this->getPhpBinary() . ' -r ' . escapeshellarg($phpCode);
     }
 }
